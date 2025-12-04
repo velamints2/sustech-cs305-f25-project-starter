@@ -15,8 +15,8 @@ from utils.peer_context import PeerContext
 
 """
 This is CS305 project skeleton code. Please refer to the example files -
-  example/dump_receiver.py and
-  example/dump_sender.py 
+  example/demo_receiver.py and
+  example/demo_sender.py 
 - to learn how to play with this skeleton.
 
 The sample code is for reference only.

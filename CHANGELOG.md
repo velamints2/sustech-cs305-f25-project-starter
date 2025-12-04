@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2025-12-04]
+
+### Fix
+
+- Unify the examples prefix `dump_`->`demo_` in `peer.py` comments.
+
 ## [2025-11-24]
 
 ### Add

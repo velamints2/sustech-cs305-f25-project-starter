@@ -4,8 +4,13 @@ For SUSTech CS305 Fall 2025: P2P File Transfer with Reliable Data Transfer
 
 ## 📢 Important Updates
 
-- **[2025-11-24]** Fix potential `ModuleNotFoundError` in test scripts -[#3](https://github.com/OctCarp/sustech-cs305-f25-project-starter/pull/3) ; Clarify usage rules for the socket module - [#4](https://github.com/OctCarp/sustech-cs305-f25-project-starter/pull/4).
-- **[2025-11-03]** We release the CS305 2025 Fall Project.
+- **[2025-11-24]**
+  - Fix potential `ModuleNotFoundError` in test scripts - [#3](https://github.com/OctCarp/sustech-cs305-f25-project-starter/pull/3)
+  - Clarify usage rules for the socket module - [#4](https://github.com/OctCarp/sustech-cs305-f25-project-starter/pull/4)
+
+- **[2025-11-03]**
+  - We released the CS305 2025 Fall Project.
+
 
 These are the important updates. For full information, see [CHANGELOG.md](CHANGELOG.md) .
 
@@ -29,7 +34,7 @@ Before you begin, you should read the following two documents:
 
 To ensure all students can benefit from questions and answers, you can submit project-related questions as [**issues in this repository**](https://github.com/OctCarp/sustech-cs305-f25-project-starter/issues) . For some easy-to-answer small and common questions, you can also try to raise them in the GitHub [**repository discussions**](https://github.com/OctCarp/sustech-cs305-f25-project-starter/discussions).
 
-- **Before posting:** Please search existing issues to see if your question has already been answered.
+- **Before posting:** Please search existing (both open and closed) issues to see if your question has already been answered.
 - **When posting:** Provide a clear title, a description of the problem, and steps to reproduce it if possible.
 
 **Note:** We will only answer questions related to the project. General questions (such as: What is the TCP ACK mechanism?) will not be answered.
