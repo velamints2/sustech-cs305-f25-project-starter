@@ -12,6 +12,8 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from utils import simsocket
 from utils.simsocket import AddressType
 from utils.peer_context import PeerContext
+from congestion_control import CongestionController
+import time
 
 """
 This is CS305 project skeleton code. Please refer to the example files -
@@ -108,21 +110,23 @@ class DownloadSession:
         self.completed: bool = False
         self.last_ack_time: float = 0
     
-    def add_data(self, seq: int, data: bytes) -> bool:
+    def add_data(self, seq: int, data: bytes) -> str:
         """
         Add received data to the session.
-        
+
         :param seq: Sequence number of the data
         :param data: Data bytes
-        :return: True if this is the expected sequence number
+        :return: Status string: "in_order", "duplicate", or "ahead"
         """
         if seq == self.expected_seq:
             self.data += data
             self.expected_seq += 1
             if len(self.data) >= CHUNK_DATA_SIZE:
                 self.completed = True
-            return True
-        return False
+            return "in_order"
+        if seq < self.expected_seq:
+            return "duplicate"
+        return "ahead"
     
     def is_complete(self) -> bool:
         """Check if the chunk download is complete"""
@@ -136,43 +140,117 @@ class UploadSession:
         self.chunk_hash: str = chunk_hash
         self.chunk_data: bytes = chunk_data
         self.peer_addr: AddressType = peer_addr
-        self.next_seq: int = 1
         self.completed: bool = False
-        self.last_send_time: float = 0
-    
-    def get_next_data(self) -> tuple[int, bytes] | None:
-        """
-        Get the next chunk of data to send.
         
-        :return: Tuple of (seq, data) or None if complete
-        """
+        # RDT State
+        self.base_seq: int = 1
+        self.next_seq_num: int = 1
+        self.unacked_buffer: dict[int, dict] = {}  # seq -> {'packet': bytes, 'send_time': float, 'retransmitted': bool}
+        
+        # RTT Estimation
+        self.estimated_rtt: float = 0.5
+        self.dev_rtt: float = 0.25
+        self.timeout_interval: float = self.estimated_rtt + 4 * self.dev_rtt
+        
+        # Congestion Control
+        self.cc = CongestionController()
+        
+    def update_rtt(self, sample_rtt: float):
+        self.estimated_rtt = 0.85 * self.estimated_rtt + 0.15 * sample_rtt
+        self.dev_rtt = 0.7 * self.dev_rtt + 0.3 * abs(sample_rtt - self.estimated_rtt)
+        self.timeout_interval = self.estimated_rtt + 4 * self.dev_rtt
+
+    def send_new_packets(self, sock: simsocket.SimSocket):
         if self.completed:
-            return None
-        
-        offset = (self.next_seq - 1) * MAX_PAYLOAD
-        if offset >= len(self.chunk_data):
-            self.completed = True
-            return None
-        
-        end = min(offset + MAX_PAYLOAD, len(self.chunk_data))
-        data = self.chunk_data[offset:end]
-        seq = self.next_seq
-        return seq, data
-    
-    def handle_ack(self, ack_num: int) -> bool:
-        """
-        Handle an ACK for this upload session.
-        
-        :param ack_num: The ACK number received
-        :return: True if this advances the session
-        """
-        if ack_num == self.next_seq:
-            self.next_seq += 1
-            offset = (self.next_seq - 1) * MAX_PAYLOAD
+            return
+
+        while self.next_seq_num < self.base_seq + self.cc.get_cwnd():
+            offset = (self.next_seq_num - 1) * MAX_PAYLOAD
+            if offset >= len(self.chunk_data):
+                break 
+            
+            end = min(offset + MAX_PAYLOAD, len(self.chunk_data))
+            data = self.chunk_data[offset:end]
+            
+            pkt = Packet.build_packet(PktType.DATA, self.next_seq_num, 0, data)
+            sock.sendto(pkt, self.peer_addr)
+            
+            self.unacked_buffer[self.next_seq_num] = {
+                'packet': pkt,
+                'send_time': time.time(),
+                'retransmitted': False
+            }
+            
+            if g_context and g_context.verbose >= 3:
+                 print(f"Sent DATA seq={self.next_seq_num} to {self.peer_addr}")
+
+            self.next_seq_num += 1
+
+    def handle_ack(self, ack_num: int, sock: simsocket.SimSocket) -> bool:
+        if self.completed:
+            return False
+
+        if ack_num >= self.base_seq:
+            # New ACK
+            if ack_num in self.unacked_buffer:
+                pkt_info = self.unacked_buffer[ack_num]
+                if not pkt_info['retransmitted']:
+                    sample_rtt = time.time() - pkt_info['send_time']
+                    self.update_rtt(sample_rtt)
+            
+            self.base_seq = ack_num + 1
+            
+            # Clear buffer
+            to_remove = [k for k in self.unacked_buffer if k < self.base_seq]
+            for k in to_remove:
+                del self.unacked_buffer[k]
+                
+            self.cc.on_new_ack()
+            self.send_new_packets(sock)
+            
+            offset = (self.base_seq - 1) * MAX_PAYLOAD
             if offset >= len(self.chunk_data):
                 self.completed = True
+                
             return True
+
+        elif ack_num == self.base_seq - 1:
+            # Duplicate ACK
+            if self.cc.on_duplicate_ack():
+                if self.base_seq in self.unacked_buffer:
+                    if not self.unacked_buffer[self.base_seq]['retransmitted']:
+                        self.retransmit_packet(self.base_seq, sock)
+            return False
+            
         return False
+
+    def retransmit_packet(self, seq: int, sock: simsocket.SimSocket):
+        if seq in self.unacked_buffer:
+            pkt_info = self.unacked_buffer[seq]
+            sock.sendto(pkt_info['packet'], self.peer_addr)
+            pkt_info['retransmitted'] = True
+            pkt_info['send_time'] = time.time() # Restart timer
+            
+            if g_context and g_context.verbose >= 2:
+                print(f"Retransmitting seq={seq} to {self.peer_addr}")
+
+    def check_timeout(self, sock: simsocket.SimSocket):
+        if self.completed or not self.unacked_buffer:
+            return
+
+        if self.base_seq in self.unacked_buffer:
+            pkt_info = self.unacked_buffer[self.base_seq]
+            current_time = time.time()
+            timeout = self.timeout_interval
+            if g_context and g_context.timeout > 0:
+                timeout = g_context.timeout / 1000.0
+            
+            if current_time - pkt_info['send_time'] > timeout:
+                if g_context and g_context.verbose >= 2:
+                    print(f"Timeout for seq={self.base_seq}, timeout={timeout:.4f}")
+                
+                self.retransmit_packet(self.base_seq, sock)
+                self.cc.on_timeout()
     
     def is_complete(self) -> bool:
         """Check if the chunk upload is complete"""
@@ -355,14 +433,10 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 chunk_data = g_context.has_chunks[chunk_hash_str]
                 g_upload_sessions[from_addr] = UploadSession(chunk_hash_str, chunk_data, from_addr)
                 
-                # Send first DATA packet
-                next_data = g_upload_sessions[from_addr].get_next_data()
-                if next_data:
-                    seq, data = next_data
-                    data_pkt = Packet.build_packet(PktType.DATA, seq, 0, data)
-                    sock.sendto(data_pkt, from_addr)
-                    if g_context.verbose >= 2:
-                        print(f"Started upload to {from_addr}, sent seq {seq}")
+                # Send first DATA packet(s)
+                g_upload_sessions[from_addr].send_new_packets(sock)
+                if g_context.verbose >= 2:
+                    print(f"Started upload to {from_addr}")
     
     elif pkt_type == PktType.DATA:
         # Handle DATA: receiving chunk data
@@ -374,51 +448,45 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         
         if session_key:
             session = g_download_sessions[session_key]
-            if session.add_data(seq, payload):
-                # Send ACK
-                ack_pkt = Packet.build_packet(PktType.ACK, 0, seq, b"")
-                sock.sendto(ack_pkt, from_addr)
-                
-                # Check if download is complete
-                if session.is_complete():
-                    chunk_hash = session.chunk_hash
-                    g_downloaded_chunks[chunk_hash] = session.data
-                    g_needed_chunks.discard(chunk_hash)
-                    
-                    if g_context and g_context.verbose >= 2:
-                        print(f"Completed download of chunk {chunk_hash[:8]}...")
-                    
-                    # Remove session
-                    del g_download_sessions[session_key]
-                    
-                    # Check if all chunks are downloaded
-                    if not g_needed_chunks:
-                        # Save to file
-                        with open(g_output_file, "wb") as f:
-                            pickle.dump(g_downloaded_chunks, f)
-                        print(f"GOT {g_output_file}")
-                        
-                        # Add downloaded chunks to our collection
-                        if g_context:
-                            g_context.has_chunks.update(g_downloaded_chunks)
+            status = session.add_data(seq, payload)
+
+            ack_num = max(session.expected_seq - 1, 0)
+            ack_pkt = Packet.build_packet(PktType.ACK, 0, ack_num, b"")
+            sock.sendto(ack_pkt, from_addr)
+
+            if status == "in_order" and session.is_complete():
+                chunk_hash = session.chunk_hash
+                g_downloaded_chunks[chunk_hash] = session.data
+                g_needed_chunks.discard(chunk_hash)
+
+                if g_context and g_context.verbose >= 2:
+                    print(f"Completed download of chunk {chunk_hash[:8]}...")
+
+                # Remove session
+                del g_download_sessions[session_key]
+
+                # Check if all chunks are downloaded
+                if not g_needed_chunks:
+                    # Save to file
+                    with open(g_output_file, "wb") as f:
+                        pickle.dump(g_downloaded_chunks, f)
+                    print(f"GOT {g_output_file}")
+
+                    # Add downloaded chunks to our collection
+                    if g_context:
+                        g_context.has_chunks.update(g_downloaded_chunks)
     
     elif pkt_type == PktType.ACK:
         # Handle ACK: acknowledgment for our DATA packet
         if from_addr in g_upload_sessions:
             session = g_upload_sessions[from_addr]
-            if session.handle_ack(ack):
-                if not session.is_complete():
-                    # Send next DATA packet
-                    next_data = session.get_next_data()
-                    if next_data:
-                        seq, data = next_data
-                        data_pkt = Packet.build_packet(PktType.DATA, seq, 0, data)
-                        sock.sendto(data_pkt, from_addr)
-                else:
-                    # Upload complete, remove session
-                    if g_context and g_context.verbose >= 2:
-                        print(f"Completed upload to {from_addr}")
-                    del g_upload_sessions[from_addr]
+            session.handle_ack(ack, sock)
+            
+            if session.is_complete():
+                # Upload complete, remove session
+                if g_context and g_context.verbose >= 2:
+                    print(f"Completed upload to {from_addr}")
+                del g_upload_sessions[from_addr]
 
 
 def process_user_input(sock: simsocket.SimSocket) -> None:
@@ -468,9 +536,10 @@ def peer_run(context: PeerContext) -> None:
                     process_inbound_udp(sock)
                 if sys.stdin in read_ready:
                     process_user_input(sock)
-            else:
-                # No pkt nor input arrives during this period
-                pass
+            
+            # Check timeouts
+            for session in list(g_upload_sessions.values()):
+                session.check_timeout(sock)
     except KeyboardInterrupt:
         pass
     finally:
