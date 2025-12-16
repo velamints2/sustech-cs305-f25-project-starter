@@ -5,6 +5,7 @@ import socket
 import hashlib
 import argparse
 import pickle
+from typing import TextIO
 
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -44,6 +45,17 @@ class PktType:
     DATA: int = 3
     ACK: int = 4
     DENIED: int = 5
+
+
+# Packet name mapping for logging
+PKT_NAME = {
+    PktType.WHOHAS: "WHOHAS",
+    PktType.IHAVE: "IHAVE",
+    PktType.GET: "GET",
+    PktType.DATA: "DATA",
+    PktType.ACK: "ACK",
+    PktType.DENIED: "DENIED",
+}
 
 
 class Packet:
@@ -109,6 +121,7 @@ class DownloadSession:
         self.expected_seq: int = 1
         self.completed: bool = False
         self.last_ack_time: float = 0
+        self.last_data_time: float = time.time()
     
     def add_data(self, seq: int, data: bytes) -> str:
         """
@@ -123,9 +136,12 @@ class DownloadSession:
             self.expected_seq += 1
             if len(self.data) >= CHUNK_DATA_SIZE:
                 self.completed = True
+            self.last_data_time = time.time()
             return "in_order"
         if seq < self.expected_seq:
+            self.last_data_time = time.time()
             return "duplicate"
+        self.last_data_time = time.time()
         return "ahead"
     
     def is_complete(self) -> bool:
@@ -268,6 +284,20 @@ g_output_file: str = ""
 
 # Global peer context
 g_context: PeerContext | None = None
+g_stdin_eof: bool = False
+g_peer_log: TextIO | None = None
+
+# WHOHAS retry mechanism
+g_last_whohas_time: float = 0
+g_whohas_retry_interval: float = 5.0  # 每5秒重发一次WHOHAS
+g_download_timeout: float = 2.0  # 下载会话超时时间（秒）
+
+
+def log_peer(event: str) -> None:
+    """Write a peer-level log line with timestamp if logging is enabled."""
+    if g_peer_log:
+        g_peer_log.write(f"{time.time():.3f} {event}\n")
+        g_peer_log.flush()
 
 
 def process_download(
@@ -286,11 +316,12 @@ def process_download(
     :param chunk_file: Path to the file containing hashes of chunks to download.
     :param output_file: Path to the file to save the downloaded chunk data.
     """
-    global g_needed_chunks, g_downloaded_chunks, g_output_file, g_context
+    global g_needed_chunks, g_downloaded_chunks, g_output_file, g_context, g_last_whohas_time
     
     g_output_file = output_file
     g_needed_chunks.clear()
     g_downloaded_chunks.clear()
+    g_last_whohas_time = time.time()
     
     # Step 1: Read chunk hashes from the chunk file
     chunk_hashes: list[str] = []
@@ -327,6 +358,7 @@ def process_download(
                 sock.sendto(whohas_pkt, peer_addr)
                 if g_context.verbose >= 2:
                     print(f"Sent WHOHAS to peer {peer_id} at {peer_addr}")
+                log_peer(f"SENT WHOHAS -> {peer_addr} payload_len={len(payload)}")
 
 
 def process_inbound_udp(sock: simsocket.SimSocket) -> None:
@@ -354,6 +386,9 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     
     if g_context and g_context.verbose >= 3:
         print(f"Received pkt type {pkt_type} from {from_addr}, seq={seq}, ack={ack}")
+    log_peer(
+        f"RECV {PKT_NAME.get(pkt_type, pkt_type)} from {from_addr} seq={seq} ack={ack} payload_len={len(payload)}"
+    )
     
     # Route packet based on type
     if pkt_type == PktType.WHOHAS:
@@ -378,6 +413,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             sock.sendto(denied_pkt, from_addr)
             if g_context.verbose >= 2:
                 print(f"Sent DENIED to {from_addr} (max connections reached)")
+            log_peer(f"SENT DENIED -> {from_addr} (max connections)")
         elif available_hashes:
             # Send IHAVE with available chunk hashes
             ihave_payload = b""
@@ -388,6 +424,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             sock.sendto(ihave_pkt, from_addr)
             if g_context and g_context.verbose >= 2:
                 print(f"Sent IHAVE to {from_addr} with {len(available_hashes)} chunks")
+            log_peer(f"SENT IHAVE -> {from_addr} count={len(available_hashes)}")
     
     elif pkt_type == PktType.IHAVE:
         # Handle IHAVE: extract available chunks and send GET requests
@@ -404,6 +441,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 get_payload = chunk_hash_bytes
                 get_pkt = Packet.build_packet(PktType.GET, 0, 0, get_payload)
                 sock.sendto(get_pkt, from_addr)
+                log_peer(f"SENT GET -> {from_addr} for {chunk_hash_str[:8]}")
                 
                 # Create download session
                 g_download_sessions[session_key] = DownloadSession(chunk_hash_str, from_addr)
@@ -437,6 +475,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 g_upload_sessions[from_addr].send_new_packets(sock)
                 if g_context.verbose >= 2:
                     print(f"Started upload to {from_addr}")
+                log_peer(f"START UPLOAD to {from_addr} chunk={chunk_hash_str[:8]}")
     
     elif pkt_type == PktType.DATA:
         # Handle DATA: receiving chunk data
@@ -453,6 +492,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
             ack_num = max(session.expected_seq - 1, 0)
             ack_pkt = Packet.build_packet(PktType.ACK, 0, ack_num, b"")
             sock.sendto(ack_pkt, from_addr)
+            log_peer(f"SENT ACK -> {from_addr} ack={ack_num}")
 
             if status == "in_order" and session.is_complete():
                 chunk_hash = session.chunk_hash
@@ -461,20 +501,38 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
 
                 if g_context and g_context.verbose >= 2:
                     print(f"Completed download of chunk {chunk_hash[:8]}...")
+                log_peer(f"CHUNK COMPLETE {chunk_hash[:8]} from {from_addr}")
 
                 # Remove session
                 del g_download_sessions[session_key]
 
-                # Check if all chunks are downloaded
+                # If all chunks are downloaded, save to file
                 if not g_needed_chunks:
-                    # Save to file
                     with open(g_output_file, "wb") as f:
                         pickle.dump(g_downloaded_chunks, f)
                     print(f"GOT {g_output_file}")
+                    log_peer(f"DOWNLOAD COMPLETE saved {g_output_file}")
 
                     # Add downloaded chunks to our collection
                     if g_context:
                         g_context.has_chunks.update(g_downloaded_chunks)
+                else:
+                    # Still need more chunks: re-broadcast WHOHAS for remaining hashes
+                    if g_context:
+                        # Build payload of remaining hashes
+                        payload = b""
+                        for remaining_hash in g_needed_chunks:
+                            payload += bytes.fromhex(remaining_hash)
+                        whohas_pkt = Packet.build_packet(PktType.WHOHAS, 0, 0, payload)
+                        for peer in g_context.peers:
+                            peer_id = int(peer[0])
+                            if peer_id != g_context.identity:
+                                peer_addr = (peer[1], int(peer[2]))
+                                sock.sendto(whohas_pkt, peer_addr)
+                        if g_context.verbose >= 2:
+                            print(f"Re-broadcasted WHOHAS for {len(g_needed_chunks)} remaining chunks")
+                        log_peer(f"RE-BROADCAST WHOHAS remaining={len(g_needed_chunks)}")
+                
     
     elif pkt_type == PktType.ACK:
         # Handle ACK: acknowledgment for our DATA packet
@@ -486,6 +544,7 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 # Upload complete, remove session
                 if g_context and g_context.verbose >= 2:
                     print(f"Completed upload to {from_addr}")
+                log_peer(f"UPLOAD COMPLETE to {from_addr}")
                 del g_upload_sessions[from_addr]
 
 
@@ -498,13 +557,96 @@ def process_user_input(sock: simsocket.SimSocket) -> None:
 
     :param sock: The :class:`simsocket.SimSocket` to be passed to
                  :func:`process_download`.
+        global g_stdin_eof
+        if g_stdin_eof:
+            return
+    
     :type sock: simsocket.SimSocket
     """
-    command, chunk_file, output_file = input().split()
-    if command == "DOWNLOAD":
-        process_download(sock, chunk_file, output_file)
-    else:
-        pass
+    try:
+        command, chunk_file, output_file = input().split()
+        if command == "DOWNLOAD":
+            process_download(sock, chunk_file, output_file)
+        else:
+            pass
+    except (EOFError, ValueError):
+        # EOF or invalid input
+        g_stdin_eof = True
+
+
+def check_whohas_retry(sock: simsocket.SimSocket) -> None:
+    """检查是否需要重发WHOHAS请求"""
+    global g_last_whohas_time, g_needed_chunks, g_download_sessions, g_context
+    
+    # 只有当有需要的chunks且没有对应会话时才重发
+    if not g_needed_chunks:
+        return
+    
+    current_time = time.time()
+    if current_time - g_last_whohas_time < g_whohas_retry_interval:
+        return
+    
+    # 检查是否有chunks没有下载会话
+    chunks_without_session = []
+    for chunk_hash in g_needed_chunks:
+        has_session = any(key[1] == chunk_hash for key in g_download_sessions.keys())
+        if not has_session:
+            chunks_without_session.append(chunk_hash)
+    
+    if not chunks_without_session:
+        return
+    
+    # 重发WHOHAS
+    if g_context and g_context.verbose >= 1:
+        print(f"Resending WHOHAS for {len(chunks_without_session)} chunks without sessions")
+    log_peer(f"RESEND WHOHAS missing_sessions={len(chunks_without_session)}")
+    
+    payload = b""
+    for chunk_hash_str in chunks_without_session:
+        payload += bytes.fromhex(chunk_hash_str)
+    
+    whohas_pkt = Packet.build_packet(PktType.WHOHAS, 0, 0, payload)
+    
+    if g_context:
+        for peer in g_context.peers:
+            peer_id = int(peer[0])
+            if peer_id != g_context.identity:
+                peer_addr = (peer[1], int(peer[2]))
+                sock.sendto(whohas_pkt, peer_addr)
+    
+    g_last_whohas_time = current_time
+
+
+def check_download_timeouts(sock: simsocket.SimSocket) -> None:
+    """检测下载会话超时，若超时则重发WHOHAS重新找来源。"""
+    global g_download_sessions, g_context, g_download_timeout
+
+    timeout_sec = g_download_timeout
+    if g_context and g_context.timeout > 0:
+        timeout_sec = max(1.0, (g_context.timeout / 1000.0) * 2)
+
+    now = time.time()
+    timed_out: list[tuple[AddressType, str]] = []
+
+    for key, session in list(g_download_sessions.items()):
+        if now - session.last_data_time > timeout_sec:
+            timed_out.append((key[0], session.chunk_hash))
+            del g_download_sessions[key]
+
+    if not timed_out:
+        return
+
+    # 对超时的chunk重新广播 WHOHAS
+    for _, chunk_hash in timed_out:
+        payload = bytes.fromhex(chunk_hash)
+        whohas_pkt = Packet.build_packet(PktType.WHOHAS, 0, 0, payload)
+        if g_context:
+            for peer in g_context.peers:
+                peer_id = int(peer[0])
+                if peer_id != g_context.identity:
+                    peer_addr = (peer[1], int(peer[2]))
+                    sock.sendto(whohas_pkt, peer_addr)
+        log_peer(f"DOWNLOAD TIMEOUT {chunk_hash[:8]} -> re-WHOHAS")
 
 
 def peer_run(context: PeerContext) -> None:
@@ -519,8 +661,12 @@ def peer_run(context: PeerContext) -> None:
 
     :param context: The peer's configuration and state object.
     """
-    global g_context
+    global g_context, g_peer_log
     g_context = context
+    log_path = Path("logs") / f"peer_{context.identity}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    g_peer_log = open(log_path, "a", buffering=1)
+    log_peer(f"START peer id={context.identity} port={context.port}")
     
     addr: AddressType = (context.ip, context.port)
     sock = simsocket.SimSocket(context.identity, addr, verbose=context.verbose)
@@ -537,12 +683,21 @@ def peer_run(context: PeerContext) -> None:
                 if sys.stdin in read_ready:
                     process_user_input(sock)
             
+            # Check if we need to resend WHOHAS for chunks without sessions
+            check_whohas_retry(sock)
+            # Check for stalled download sessions
+            check_download_timeouts(sock)
+            
             # Check timeouts
             for session in list(g_upload_sessions.values()):
                 session.check_timeout(sock)
     except KeyboardInterrupt:
         pass
     finally:
+        log_peer("STOP peer")
+        if g_peer_log:
+            g_peer_log.close()
+            g_peer_log = None
         sock.close()
 
 
