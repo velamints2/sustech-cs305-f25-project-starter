@@ -80,9 +80,6 @@ class CongestionController:
         # 2. 重置 cwnd: cwnd is then set to 1
         self.cwnd = 1.0
 
-        # 3. 重置状态 (跳回慢启动)
-        self.dup_ack_count = 0
-
         self.record_cwnd()
 
     def plot_analysis(self, filename="concurrency_analysis.png"):
