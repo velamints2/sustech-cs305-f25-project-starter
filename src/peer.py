@@ -462,26 +462,66 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
         if g_context and g_context.verbose >= 2:
             print(f"Received DENIED from {from_addr}")
         # Could implement retry logic here, but for now just log it
-    
+
     elif pkt_type == PktType.GET:
         # Handle GET: peer wants to download a chunk from us
         chunk_hash_bytes = payload[:20]
         chunk_hash_str = chunk_hash_bytes.hex()
-        
+
         # Check if we have this chunk and can send it
-        if g_context and chunk_hash_str in g_context.has_chunks:
-            # Check if we already have an upload session with this peer
-            if from_addr not in g_upload_sessions:
-                # Create upload session
-                chunk_data = g_context.has_chunks[chunk_hash_str]
-                g_upload_sessions[from_addr] = UploadSession(chunk_hash_str, chunk_data, from_addr)
-                
-                # Send first DATA packet(s)
-                g_upload_sessions[from_addr].send_new_packets(sock)
-                if g_context.verbose >= 2:
-                    print(f"Started upload to {from_addr}")
-                log_peer(f"START UPLOAD to {from_addr} chunk={chunk_hash_str[:8]}")
-    
+        if not (g_context and chunk_hash_str in g_context.has_chunks):
+            # we don't have it; ignore
+            return
+
+        # We only allow one upload session PER peer (by address) at a time.
+        # If there is an existing upload session for this peer:
+        #   - if it's for a different chunk -> send DENIED
+        #   - if it's for the same chunk -> restart that session (reset state) and resend from seq=1
+        existing_session = g_upload_sessions.get(from_addr)
+
+        if existing_session is not None:
+            # If currently uploading a different chunk to same peer -> DENIED
+            if existing_session.chunk_hash != chunk_hash_str:
+                denied_pkt = Packet.build_packet(PktType.DENIED, 0, 0)
+                try:
+                    sock.sendto(denied_pkt, from_addr)
+                except Exception:
+                    pass
+                if g_context and g_context.verbose >= 2:
+                    print(f"Sent DENIED to {from_addr} (already uploading different chunk)")
+                log_peer(f"SENT DENIED -> {from_addr} (already uploading different chunk)")
+            else:
+                # Existing session is for the same chunk. Receiver is retrying.
+                # Reset the upload session state so we restart from seq=1.
+                if g_context and g_context.verbose >= 2:
+                    print(f"Restarting upload session for {from_addr} chunk={chunk_hash_str[:8]}")
+                # Reset RDT state
+                existing_session.base_seq = 1
+                existing_session.next_seq_num = 1
+                existing_session.unacked_buffer.clear()
+                existing_session.completed = False
+
+                # Reset RTT estimation / timeout if you want (optional but safer)
+                existing_session.estimated_rtt = 0.5
+                existing_session.dev_rtt = 0.25
+                existing_session.timeout_interval = existing_session.estimated_rtt + 4 * existing_session.dev_rtt
+
+                # Reset congestion control (start slow-start again)
+                existing_session.cc = CongestionController()
+
+                # Re-send from beginning
+                existing_session.send_new_packets(sock)
+                log_peer(f"RESTART UPLOAD to {from_addr} chunk={chunk_hash_str[:8]}")
+        else:
+            # No existing session -> create one and start uploading
+            chunk_data = g_context.has_chunks[chunk_hash_str]
+            g_upload_sessions[from_addr] = UploadSession(chunk_hash_str, chunk_data, from_addr)
+            g_upload_sessions[from_addr].send_new_packets(sock)
+            if g_context and g_context.verbose >= 2:
+                print(f"Started upload to {from_addr}")
+            log_peer(f"START UPLOAD to {from_addr} chunk={chunk_hash_str[:8]}")
+
+
     elif pkt_type == PktType.DATA:
         # Handle DATA: receiving chunk data
         session_key = None
