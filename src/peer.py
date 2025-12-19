@@ -264,8 +264,11 @@ class UploadSession:
             if current_time - pkt_info['send_time'] > timeout:
                 if g_context and g_context.verbose >= 2:
                     print(f"Timeout for seq={self.base_seq}, timeout={timeout:.4f}")
-                
-                self.retransmit_packet(self.base_seq, sock)
+
+                # resend all outstanding packets starting from base_seq
+                for seq in range(self.base_seq, self.next_seq_num):
+                    if seq in self.unacked_buffer:
+                        self.retransmit_packet(seq, sock)
                 self.cc.on_timeout()
     
     def is_complete(self) -> bool:
