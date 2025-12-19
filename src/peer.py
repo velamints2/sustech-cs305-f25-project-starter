@@ -122,6 +122,7 @@ class DownloadSession:
         self.completed: bool = False
         self.last_ack_time: float = 0
         self.last_data_time: float = time.time()
+        self.closing_time: float | None = None
     
     def add_data(self, seq: int, data: bytes) -> str:
         """
@@ -280,6 +281,7 @@ class UploadSession:
 
 # Global session management
 g_download_sessions: dict[tuple[AddressType, str], DownloadSession] = {}
+g_closing_sessions: dict[tuple[AddressType, str], DownloadSession] = {}
 g_upload_sessions: dict[AddressType, UploadSession] = {}
 
 # Global download state
@@ -525,13 +527,14 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
     elif pkt_type == PktType.DATA:
         # Handle DATA: receiving chunk data
         session_key = None
-        for key, session in g_download_sessions.items():
+        session = None
+        for key, candidate in g_download_sessions.items():
             if key[0] == from_addr:
                 session_key = key
+                session = candidate
                 break
-        
-        if session_key:
-            session = g_download_sessions[session_key]
+
+        if session_key is not None and session is not None:
             status = session.add_data(seq, payload)
 
             ack_num = max(session.expected_seq - 1, 0)
@@ -548,7 +551,9 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                     print(f"Completed download of chunk {chunk_hash[:8]}...")
                 log_peer(f"CHUNK COMPLETE {chunk_hash[:8]} from {from_addr}")
 
-                # Remove session
+                # Move session into closing state to handle possible retransmissions
+                session.closing_time = time.time()
+                g_closing_sessions[session_key] = session
                 del g_download_sessions[session_key]
 
                 # If all chunks are downloaded, save to file
@@ -564,7 +569,6 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                 else:
                     # Still need more chunks: re-broadcast WHOHAS for remaining hashes
                     if g_context:
-                        # Build payload of remaining hashes
                         payload = b""
                         for remaining_hash in g_needed_chunks:
                             payload += bytes.fromhex(remaining_hash)
@@ -577,7 +581,23 @@ def process_inbound_udp(sock: simsocket.SimSocket) -> None:
                         if g_context.verbose >= 2:
                             print(f"Re-broadcasted WHOHAS for {len(g_needed_chunks)} remaining chunks")
                         log_peer(f"RE-BROADCAST WHOHAS remaining={len(g_needed_chunks)}")
-                
+        else:
+            closing_key = None
+            closing_session = None
+            for key, candidate in g_closing_sessions.items():
+                if key[0] == from_addr:
+                    closing_key = key
+                    closing_session = candidate
+                    break
+
+            if closing_session is None:
+                return
+
+            ack_num = max(closing_session.expected_seq - 1, 0)
+            ack_pkt = Packet.build_packet(PktType.ACK, 0, ack_num, b"")
+            sock.sendto(ack_pkt, from_addr)
+            log_peer(f"RESENT FINAL ACK -> {from_addr} ack={ack_num}")
+            closing_session.closing_time = time.time()
     
     elif pkt_type == PktType.ACK:
         # Handle ACK: acknowledgment for our DATA packet
@@ -694,6 +714,20 @@ def check_download_timeouts(sock: simsocket.SimSocket) -> None:
         log_peer(f"DOWNLOAD TIMEOUT {chunk_hash[:8]} -> re-WHOHAS")
 
 
+def check_closing_timeouts() -> None:
+    """Clear closing sessions that have exceeded the grace period."""
+    global g_closing_sessions
+
+    now = time.time()
+    closing_timeout = 10.0
+    for key, session in list(g_closing_sessions.items()):
+        if session.closing_time is None:
+            session.closing_time = now
+        if now - session.closing_time > closing_timeout:
+            del g_closing_sessions[key]
+            log_peer(f"CLOSE SESSION CLEANUP {session.chunk_hash[:8]} from {key[0]}")
+
+
 def peer_run(context: PeerContext) -> None:
     """
     Runs the main event loop for the peer.
@@ -732,6 +766,8 @@ def peer_run(context: PeerContext) -> None:
             check_whohas_retry(sock)
             # Check for stalled download sessions
             check_download_timeouts(sock)
+            # Cleanup closing sessions waiting to ensure final ACK delivery
+            check_closing_timeouts()
             
             # Check timeouts
             for session in list(g_upload_sessions.values()):
