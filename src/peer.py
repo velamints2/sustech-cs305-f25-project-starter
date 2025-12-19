@@ -233,9 +233,11 @@ class UploadSession:
         elif ack_num == self.base_seq - 1:
             # Duplicate ACK
             if self.cc.on_duplicate_ack():
-                if self.base_seq in self.unacked_buffer:
-                    if not self.unacked_buffer[self.base_seq]['retransmitted']:
-                        self.retransmit_packet(self.base_seq, sock)
+                if g_context and g_context.verbose >= 2:
+                    print(f"Fast Retransmit triggered for seq={self.base_seq}, retransmitting window")
+                
+                for seq in range(self.base_seq, self.next_seq_num):
+                    self.retransmit_packet(seq, sock)
             return False
             
         return False
